@@ -1,11 +1,16 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Body
 from app.manager.services.eks.eks_service import EKSService
 from typing import Optional
+from pydantic import BaseModel
 
 router = APIRouter(
     prefix="/eks",
     tags=["EKS"]
 )
+
+class YAMLUpdateRequest(BaseModel):
+    yaml_content: str
+    namespace: Optional[str] = "default"
 
 @router.get("/clusters")
 async def list_clusters():
@@ -73,5 +78,47 @@ async def get_pod_details(
             namespace=namespace
         )
         return {"pod": pod_details}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.put("/clusters/{cluster_name}/components/{component_name}/yaml")
+async def update_component_yaml(
+    cluster_name: str,
+    component_name: str,
+    component_type: str,
+    update_request: YAMLUpdateRequest = Body(...)
+):
+    try:
+        eks_service = EKSService()
+        result = await eks_service.update_component_yaml(
+            cluster_name=cluster_name,
+            component_name=component_name,
+            component_type=component_type,
+            yaml_content=update_request.yaml_content,
+            namespace=update_request.namespace
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.put("/clusters/{cluster_name}/pods/{pod_name}/yaml")
+async def update_pod_yaml(
+    cluster_name: str,
+    pod_name: str,
+    update_request: YAMLUpdateRequest = Body(...)
+):
+    try:
+        eks_service = EKSService()
+        result = await eks_service.update_pod_yaml(
+            cluster_name=cluster_name,
+            pod_name=pod_name,
+            yaml_content=update_request.yaml_content,
+            namespace=update_request.namespace
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) 
