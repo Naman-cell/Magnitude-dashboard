@@ -1,1 +1,0 @@
-# ECR services package initialization 

@@ -4,6 +4,7 @@ from typing import List, Dict, Any
 from dotenv import load_dotenv
 import yaml
 import json
+from app.core.config import settings
 
 class EKSService:
     def __init__(self):

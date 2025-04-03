@@ -1,1 +1,0 @@
-# Manager services package initialization 

@@ -1,1 +1,0 @@
-# EKS endpoints package initialization 
