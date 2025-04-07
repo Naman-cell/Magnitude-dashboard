@@ -9,7 +9,9 @@ import subprocess
 import tempfile
 import base64
 import logging
-from eks_token import get_token
+from kubernetes import client, config
+from kubernetes.client import ApiClient
+from kubernetes.config.kube_config import KubeConfigLoader
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +53,64 @@ class EKSService:
             
             # Get AWS credentials from the boto3 session
             credentials = self.boto_session.get_credentials()
-            print(f"Credentials: {credentials.access_key}")
+            
+            # Create kubeconfig content
+            kubeconfig = {
+                "apiVersion": "v1",
+                "kind": "Config",
+                "clusters": [{
+                    "name": cluster_name,
+                    "cluster": {
+                        "server": cluster_data['endpoint'],
+                        "certificate-authority-data": cluster_data['certificateAuthority']['data']
+                    }
+                }],
+                "contexts": [{
+                    "name": cluster_name,
+                    "context": {
+                        "cluster": cluster_name,
+                        "user": "aws"
+                    }
+                }],
+                "current-context": cluster_name,
+                "users": [{
+                    "name": "aws",
+                    "user": {
+                        "exec": {
+                            "apiVersion": "client.authentication.k8s.io/v1beta1",
+                            "command": "aws",
+                            "args": [
+                                "eks",
+                                "get-token",
+                                "--cluster-name",
+                                cluster_name,
+                                "--region",
+                                os.getenv("AWS_DEFAULT_REGION")
+                            ]
+                        }
+                    }
+                }]
+            }
+            
+            return yaml.dump(kubeconfig)
+        except Exception as e:
+            logger.error(f"Error getting kubeconfig: {str(e)}")
+            raise
+
+    async def _get_kubernetes_client(self, cluster_name: str) -> client.ApiClient:
+        """Get a Kubernetes API client for the specified cluster."""
+        try:
+            # Get cluster details
+            cluster = self.eks_client.describe_cluster(name=cluster_name)
+            cluster_data = cluster['cluster']
+            
+            # Get AWS credentials
+            credentials = self.boto_session.get_credentials()
+            
+            # Debug logging
+            logger.info(f"Using AWS credentials: Access Key ID: {credentials.access_key[:4]}...")
+            logger.info(f"Cluster endpoint: {cluster_data['endpoint']}")
+            logger.info(f"Cluster status: {cluster_data['status']}")
             
             # Create kubeconfig content
             kubeconfig = {
@@ -81,7 +140,9 @@ class EKSService:
                             "args": [
                                 "token",
                                 "-i",
-                                cluster_name
+                                cluster_name,
+                                "-r",
+                                os.getenv('AWS_DEFAULT_REGION')
                             ],
                             "env": [
                                 {
@@ -94,7 +155,7 @@ class EKSService:
                                 },
                                 {
                                     "name": "AWS_DEFAULT_REGION",
-                                    "value": os.getenv("AWS_DEFAULT_REGION")
+                                    "value": os.getenv('AWS_DEFAULT_REGION')
                                 }
                             ]
                         }
@@ -102,14 +163,59 @@ class EKSService:
                 }]
             }
             
-            # Write kubeconfig to a temporary file for debugging
+            # Create a temporary file for the kubeconfig
             with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
                 f.write(yaml.dump(kubeconfig))
-                logger.info(f"Generated kubeconfig saved to: {f.name}")
+                kubeconfig_path = f.name
             
-            return yaml.dump(kubeconfig)
+            # Load the kubeconfig
+            loader = KubeConfigLoader(
+                config_dict=kubeconfig,
+                active_context=cluster_name,
+                get_google_credentials=lambda: None,
+                config_base_path=None
+            )
+            
+            # Create configuration
+            configuration = client.Configuration()
+            loader.load_and_set(configuration)
+            
+            # Create API client
+            api_client = client.ApiClient(configuration)
+            
+            # Test the connection
+            try:
+                v1 = client.CoreV1Api(api_client)
+                v1.list_namespaces()  # This will test the connection
+                logger.info("Successfully connected to the EKS cluster")
+            except Exception as e:
+                logger.error(f"Failed to connect to EKS cluster: {str(e)}")
+                raise
+            
+            return api_client
+            
         except Exception as e:
-            logger.error(f"Error getting kubeconfig: {str(e)}")
+            logger.error(f"Error creating Kubernetes client: {str(e)}")
+            raise
+        finally:
+            # Clean up temporary file
+            try:
+                os.unlink(kubeconfig_path)
+            except:
+                pass
+
+    def _get_certificate(self, certificate_data: str) -> str:
+        """Convert base64 certificate data to a temporary certificate file."""
+        try:
+            # Decode base64 certificate
+            cert_data = base64.b64decode(certificate_data)
+            
+            # Create temporary file for certificate
+            with tempfile.NamedTemporaryFile(mode='wb', suffix='.pem', delete=False) as f:
+                f.write(cert_data)
+                return f.name
+        except Exception as e:
+            logger.error(f"Error creating certificate file: {str(e)}")
             raise
 
     def _apply_yaml(self, kubeconfig: str, yaml_content: str, namespace: str = 'default') -> Dict[str, Any]:
@@ -129,6 +235,12 @@ class EKSService:
                 yaml_file.write(yaml_content)
                 yaml_file.flush()
                 
+                # Prepare environment with AWS credentials
+                env = os.environ.copy()
+                env['AWS_ACCESS_KEY_ID'] = os.getenv('AWS_ACCESS_KEY_ID')
+                env['AWS_SECRET_ACCESS_KEY'] = os.getenv('AWS_SECRET_ACCESS_KEY')
+                env['AWS_DEFAULT_REGION'] = os.getenv('AWS_DEFAULT_REGION')
+                
                 # Apply YAML using kubectl
                 cmd = [
                     'kubectl',
@@ -138,7 +250,7 @@ class EKSService:
                     '-n', namespace
                 ]
                 
-                result = subprocess.run(cmd, capture_output=True, text=True, env=os.environ.copy())
+                result = subprocess.run(cmd, capture_output=True, text=True, env=env)
                 
                 if result.returncode != 0:
                     raise Exception(f"Failed to apply YAML: {result.stderr}")
@@ -155,7 +267,7 @@ class EKSService:
                     '-o', 'json'
                 ]
                 
-                get_result = subprocess.run(get_cmd, capture_output=True, text=True, env=os.environ.copy())
+                get_result = subprocess.run(get_cmd, capture_output=True, text=True, env=env)
                 
                 if get_result.returncode != 0:
                     raise Exception(f"Failed to get resource details: {get_result.stderr}")
@@ -278,131 +390,281 @@ class EKSService:
                 pass
 
     async def get_component_yaml(self, cluster_name: str, component_name: str, 
-                               component_type: str, namespace: str = 'default') -> str:
+                               component_type: str, namespace: str = 'api-service') -> str:
         """
         Get YAML configuration for a specific Kubernetes component
         """
         try:
-            # Get kubeconfig
-            kubeconfig = await self._get_kubeconfig(cluster_name)
+            # Get cluster details
+            cluster = self.eks_client.describe_cluster(name=cluster_name)
+            cluster_data = cluster['cluster']
             
-            # Create temporary file for kubeconfig
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as kubeconfig_file:
-                kubeconfig_file.write(kubeconfig)
-                kubeconfig_file.flush()
-                
-                # Get component YAML using kubectl
-                cmd = [
-                    'kubectl',
-                    '--kubeconfig', kubeconfig_file.name,
-                    'get', component_type.lower(), component_name,
-                    '-n', namespace,
-                    '-o', 'yaml'
-                ]
-                
-                result = subprocess.run(cmd, capture_output=True, text=True, env=os.environ.copy())
-                
-                if result.returncode != 0:
-                    raise Exception(f"Failed to get component YAML: {result.stderr}")
-                
-                return result.stdout
-                
-        except Exception as e:
-            raise Exception(f"Failed to get component YAML: {str(e)}")
-        finally:
-            # Clean up temporary file
+            # Get AWS credentials
+            credentials = self.boto_session.get_credentials()
+            
+            # Debug logging
+            logger.info(f"Getting YAML for {component_type} {component_name} in namespace {namespace}")
+            
+            # Create kubeconfig content
+            kubeconfig = {
+                "apiVersion": "v1",
+                "kind": "Config",
+                "clusters": [{
+                    "name": cluster_name,
+                    "cluster": {
+                        "server": cluster_data['endpoint'],
+                        "certificate-authority-data": cluster_data['certificateAuthority']['data']
+                    }
+                }],
+                "contexts": [{
+                    "name": cluster_name,
+                    "context": {
+                        "cluster": cluster_name,
+                        "user": "aws"
+                    }
+                }],
+                "current-context": cluster_name,
+                "users": [{
+                    "name": "aws",
+                    "user": {
+                        "exec": {
+                            "apiVersion": "client.authentication.k8s.io/v1beta1",
+                            "command": "aws",
+                            "args": [
+                                "eks",
+                                "get-token",
+                                "--cluster-name",
+                                cluster_name,
+                                "--region",
+                                os.getenv("AWS_DEFAULT_REGION")
+                            ],
+                            "env": [
+                                {
+                                    "name": "AWS_ACCESS_KEY_ID",
+                                    "value": credentials.access_key
+                                },
+                                {
+                                    "name": "AWS_SECRET_ACCESS_KEY",
+                                    "value": credentials.secret_key
+                                },
+                                {
+                                    "name": "AWS_DEFAULT_REGION",
+                                    "value": os.getenv("AWS_DEFAULT_REGION")
+                                }
+                            ]
+                        }
+                    }
+                }]
+            }
+            
+            # Create a temporary file for the kubeconfig
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+                f.write(yaml.dump(kubeconfig))
+                kubeconfig_path = f.name
+            
             try:
-                os.unlink(kubeconfig_file.name)
-            except:
-                pass
+                # Load the kubeconfig
+                loader = KubeConfigLoader(
+                    config_dict=kubeconfig,
+                    active_context=cluster_name,
+                    get_google_credentials=lambda: None,
+                    config_base_path=None
+                )
+                
+                # Create configuration
+                configuration = client.Configuration()
+                loader.load_and_set(configuration)
+                
+                # Create API client
+                api_client = client.ApiClient(configuration)
+                
+                # Get the appropriate API based on component type
+                if component_type.lower() == 'deployment':
+                    api = client.AppsV1Api(api_client)
+                    response = api.read_namespaced_deployment(
+                        name=component_name,
+                        namespace=namespace
+                    )
+                elif component_type.lower() == 'service':
+                    api = client.CoreV1Api(api_client)
+                    response = api.read_namespaced_service(
+                        name=component_name,
+                        namespace=namespace
+                    )
+                elif component_type.lower() == 'pod':
+                    api = client.CoreV1Api(api_client)
+                    response = api.read_namespaced_pod(
+                        name=component_name,
+                        namespace=namespace
+                    )
+                else:
+                    raise ValueError(f"Unsupported component type: {component_type}")
+                
+                # Convert to YAML
+                yaml_content = yaml.dump(response.to_dict())
+                return yaml_content
+                
+            except client.rest.ApiException as e:
+                if e.status == 404:
+                    raise Exception(f"{component_type} '{component_name}' not found in namespace '{namespace}'")
+                else:
+                    raise Exception(f"Failed to get {component_type} YAML: {str(e)}")
+            except Exception as e:
+                raise Exception(f"Failed to get {component_type} YAML: {str(e)}")
+            finally:
+                # Clean up temporary file
+                try:
+                    os.unlink(kubeconfig_path)
+                except:
+                    pass
+                    
+        except Exception as e:
+            logger.error(f"Failed to get component YAML: {str(e)}")
+            raise Exception(f"Failed to get component YAML: {str(e)}")
 
-    async def list_pods(self, cluster_name: str, namespace: str = 'default') -> List[Dict[str, Any]]:
+    async def list_pods(self, cluster_name: str, namespace: str = 'api-service') -> List[Dict[str, Any]]:
         """
-        List all pods in a specific namespace of a cluster
+        List all pods in a specific namespace of a cluster using Kubernetes API
         """
         try:
-            # Get kubeconfig
-            kubeconfig = await self._get_kubeconfig(cluster_name)
+            # Get cluster details
+            cluster = self.eks_client.describe_cluster(name=cluster_name)
+            cluster_data = cluster['cluster']
             
-            # Create temporary file for kubeconfig
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as kubeconfig_file:
-                kubeconfig_file.write(kubeconfig)
-                kubeconfig_file.flush()
-                
-                # Get pods in JSON format
-                cmd = [
-                    'kubectl',
-                    '--kubeconfig', kubeconfig_file.name,
-                    'get', 'pods',
-                    '-n', namespace,
-                    '-o', 'json'
-                ]
-                
-                result = subprocess.run(cmd, capture_output=True, text=True, env=os.environ.copy())
-                
-                if result.returncode != 0:
-                    raise Exception(f"Failed to get pods: {result.stderr}")
-                
-                data = json.loads(result.stdout)
-                pods = []
-                
-                for item in data.get('items', []):
-                    metadata = item.get('metadata', {})
-                    spec = item.get('spec', {})
-                    status = item.get('status', {})
-                    
-                    # Get container statuses
-                    container_statuses = status.get('containerStatuses', [])
-                    containers = []
-                    
-                    for container_status in container_statuses:
-                        container = {
-                            'name': container_status.get('name'),
-                            'image': container_status.get('image'),
-                            'ready': container_status.get('ready', False),
-                            'restart_count': container_status.get('restartCount', 0),
-                            'state': container_status.get('state', {}),
-                            'last_state': container_status.get('lastState', {})
-                        }
-                        containers.append(container)
-                    
-                    # Get pod conditions
-                    conditions = status.get('conditions', [])
-                    pod_conditions = []
-                    for condition in conditions:
-                        pod_conditions.append({
-                            'type': condition.get('type'),
-                            'status': condition.get('status'),
-                            'last_transition_time': condition.get('lastTransitionTime'),
-                            'reason': condition.get('reason'),
-                            'message': condition.get('message')
-                        })
-                    
-                    pod = {
-                        'name': metadata.get('name'),
-                        'namespace': metadata.get('namespace'),
-                        'status': status.get('phase', 'Unknown'),
-                        'ip': status.get('podIP'),
-                        'node': spec.get('nodeName'),
-                        'host_ip': status.get('hostIP'),
-                        'start_time': status.get('startTime'),
-                        'containers': containers,
-                        'conditions': pod_conditions,
-                        'labels': metadata.get('labels', {}),
-                        'annotations': metadata.get('annotations', {}),
-                        'spec': spec,
-                        'status': status
+            # Get AWS credentials
+            credentials = self.boto_session.get_credentials()
+            
+            # Debug logging
+            logger.info(f"Using AWS credentials: Access Key ID: {credentials.access_key[:4]}...")
+            logger.info(f"Cluster endpoint: {cluster_data['endpoint']}")
+            logger.info(f"Cluster status: {cluster_data['status']}")
+            logger.info(f"Listing pods in namespace: {namespace}")
+            
+            # Create kubeconfig content
+            kubeconfig = {
+                "apiVersion": "v1",
+                "kind": "Config",
+                "clusters": [{
+                    "name": cluster_name,
+                    "cluster": {
+                        "server": cluster_data['endpoint'],
+                        "certificate-authority-data": cluster_data['certificateAuthority']['data']
                     }
-                    pods.append(pod)
-                
-                return pods
-                
+                }],
+                "contexts": [{
+                    "name": cluster_name,
+                    "context": {
+                        "cluster": cluster_name,
+                        "user": "aws"
+                    }
+                }],
+                "current-context": cluster_name,
+                "users": [{
+                    "name": "aws",
+                    "user": {
+                        "exec": {
+                            "apiVersion": "client.authentication.k8s.io/v1beta1",
+                            "command": "aws",
+                            "args": [
+                                "eks",
+                                "get-token",
+                                "--cluster-name",
+                                cluster_name,
+                                "--region",
+                                os.getenv("AWS_DEFAULT_REGION")
+                            ],
+                            "env": [
+                                {
+                                    "name": "AWS_ACCESS_KEY_ID",
+                                    "value": credentials.access_key
+                                },
+                                {
+                                    "name": "AWS_SECRET_ACCESS_KEY",
+                                    "value": credentials.secret_key
+                                },
+                                {
+                                    "name": "AWS_DEFAULT_REGION",
+                                    "value": os.getenv("AWS_DEFAULT_REGION")
+                                }
+                            ]
+                        }
+                    }
+                }]
+            }
+            
+            # Create a temporary file for the kubeconfig
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+                f.write(yaml.dump(kubeconfig))
+                kubeconfig_path = f.name
+            
+            # Load the kubeconfig
+            loader = KubeConfigLoader(
+                config_dict=kubeconfig,
+                active_context=cluster_name,
+                get_google_credentials=lambda: None,
+                config_base_path=None
+            )
+            
+            # Create configuration
+            configuration = client.Configuration()
+            loader.load_and_set(configuration)
+            
+            # Create API client
+            api_client = client.ApiClient(configuration)
+            v1 = client.CoreV1Api(api_client)
+            
+            # List pods
+            pods_response = v1.list_namespaced_pod(namespace=namespace)
+            
+            pods = []
+            for pod in pods_response.items:
+                pod_dict = {
+                    'kind': 'Pod',
+                    'apiVersion': 'v1',
+                    'metadata': {
+                        'name': pod.metadata.name,
+                        'namespace': pod.metadata.namespace,
+                        'labels': pod.metadata.labels or {},
+                        'creationTimestamp': pod.metadata.creation_timestamp.isoformat() if pod.metadata.creation_timestamp else None,
+                        'uid': pod.metadata.uid
+                    },
+                    'spec': {
+                        'containers': [{
+                            'name': container.name,
+                            'image': container.image,
+                            'ports': [{'containerPort': port.container_port, 'protocol': port.protocol} for port in container.ports or []],
+                            'resources': container.resources.to_dict() if container.resources else {}
+                        } for container in pod.spec.containers],
+                        'nodeName': pod.spec.node_name,
+                        'serviceAccountName': pod.spec.service_account_name
+                    },
+                    'status': {
+                        'phase': pod.status.phase,
+                        'podIP': pod.status.pod_ip,
+                        'hostIP': pod.status.host_ip,
+                        'startTime': pod.status.start_time.isoformat() if pod.status.start_time else None,
+                        'conditions': [{
+                            'type': condition.type,
+                            'status': condition.status,
+                            'lastTransitionTime': condition.last_transition_time.isoformat() if condition.last_transition_time else None,
+                            'reason': condition.reason,
+                            'message': condition.message
+                        } for condition in pod.status.conditions or []]
+                    }
+                }
+                pods.append(pod_dict)
+            
+            logger.info(f"Found {len(pods)} pods in namespace {namespace}")
+            return pods
+            
         except Exception as e:
+            logger.error(f"Failed to list pods: {str(e)}")
+            logger.error(f"Error details: {type(e).__name__}: {str(e)}")
             raise Exception(f"Failed to list pods: {str(e)}")
         finally:
             # Clean up temporary file
             try:
-                os.unlink(kubeconfig_file.name)
+                os.unlink(kubeconfig_path)
             except:
                 pass
 
@@ -522,40 +784,172 @@ class EKSService:
 
     async def update_component_yaml(self, cluster_name: str, component_name: str, 
                                   component_type: str, yaml_content: str, 
-                                  namespace: str = 'default') -> Dict[str, Any]:
+                                  namespace: str = 'api-service') -> Dict[str, Any]:
         """
         Update a Kubernetes component configuration using YAML
         """
         try:
-            # Validate YAML content
+            # Clean up the YAML content
+            yaml_content = yaml_content.replace("'", "").replace("\\n", "\n")
+            
+            # Parse the YAML to validate and fix formatting
             try:
                 yaml_data = yaml.safe_load(yaml_content)
                 if not yaml_data:
                     raise ValueError("Invalid YAML content")
+                
+                # Ensure apiVersion is set correctly
+                if 'api_version' in yaml_data:
+                    yaml_data['apiVersion'] = yaml_data.pop('api_version')
+                
+                # Ensure kind matches the component type
                 if yaml_data.get('kind') != component_type:
                     raise ValueError(f"YAML content must be for a {component_type} resource")
+                
+                # Ensure namespace is set correctly
+                if 'metadata' in yaml_data:
+                    yaml_data['metadata']['namespace'] = namespace
+                    
+                    # Ensure all annotation values are strings
+                    if 'annotations' in yaml_data['metadata']:
+                        annotations = yaml_data['metadata']['annotations']
+                        for key, value in annotations.items():
+                            if not isinstance(value, str):
+                                annotations[key] = str(value)
+                
+                # Convert back to YAML string
+                yaml_content = yaml.dump(yaml_data)
+                
             except yaml.YAMLError as e:
                 raise ValueError(f"Invalid YAML format: {str(e)}")
             
-            # Get kubeconfig
-            kubeconfig = await self._get_kubeconfig(cluster_name)
+            # Get cluster details
+            cluster = self.eks_client.describe_cluster(name=cluster_name)
+            cluster_data = cluster['cluster']
             
-            # Apply YAML
-            result = self._apply_yaml(kubeconfig, yaml_content, namespace)
+            # Get AWS credentials
+            credentials = self.boto_session.get_credentials()
             
-            return {
-                'status': 'success',
-                'message': f'Successfully updated {component_type} {component_name} in namespace {namespace}',
-                'component': {
-                    'name': component_name,
-                    'type': component_type,
-                    'namespace': namespace,
-                    'updated_at': datetime.now().isoformat(),
-                    'details': result['details']
-                }
+            # Debug logging
+            logger.info(f"Updating YAML for {component_type} {component_name} in namespace {namespace}")
+            
+            # Create kubeconfig content
+            kubeconfig = {
+                "apiVersion": "v1",
+                "kind": "Config",
+                "clusters": [{
+                    "name": cluster_name,
+                    "cluster": {
+                        "server": cluster_data['endpoint'],
+                        "certificate-authority-data": cluster_data['certificateAuthority']['data']
+                    }
+                }],
+                "contexts": [{
+                    "name": cluster_name,
+                    "context": {
+                        "cluster": cluster_name,
+                        "user": "aws"
+                    }
+                }],
+                "current-context": cluster_name,
+                "users": [{
+                    "name": "aws",
+                    "user": {
+                        "exec": {
+                            "apiVersion": "client.authentication.k8s.io/v1beta1",
+                            "command": "aws",
+                            "args": [
+                                "eks",
+                                "get-token",
+                                "--cluster-name",
+                                cluster_name,
+                                "--region",
+                                os.getenv("AWS_DEFAULT_REGION")
+                            ],
+                            "env": [
+                                {
+                                    "name": "AWS_ACCESS_KEY_ID",
+                                    "value": credentials.access_key
+                                },
+                                {
+                                    "name": "AWS_SECRET_ACCESS_KEY",
+                                    "value": credentials.secret_key
+                                },
+                                {
+                                    "name": "AWS_DEFAULT_REGION",
+                                    "value": os.getenv("AWS_DEFAULT_REGION")
+                                }
+                            ]
+                        }
+                    }
+                }]
             }
             
+            # Create a temporary file for the kubeconfig
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+                f.write(yaml.dump(kubeconfig))
+                kubeconfig_path = f.name
+            
+            try:
+                # Load the kubeconfig
+                loader = KubeConfigLoader(
+                    config_dict=kubeconfig,
+                    active_context=cluster_name,
+                    get_google_credentials=lambda: None,
+                    config_base_path=None
+                )
+                
+                # Create configuration
+                configuration = client.Configuration()
+                loader.load_and_set(configuration)
+                
+                # Create API client
+                api_client = client.ApiClient(configuration)
+                
+                # Get the appropriate API based on component type
+                if component_type.lower() == 'deployment':
+                    api = client.AppsV1Api(api_client)
+                    # Parse the YAML content
+                    body = yaml.safe_load(yaml_content)
+                    # Apply the deployment
+                    response = api.replace_namespaced_deployment(
+                        name=component_name,
+                        namespace=namespace,
+                        body=body
+                    )
+                elif component_type.lower() == 'service':
+                    api = client.CoreV1Api(api_client)
+                    body = yaml.safe_load(yaml_content)
+                    response = api.replace_namespaced_service(
+                        name=component_name,
+                        namespace=namespace,
+                        body=body
+                    )
+                else:
+                    raise ValueError(f"Unsupported component type: {component_type}")
+                
+                return {
+                    'status': 'success',
+                    'message': f'Successfully updated {component_type} {component_name}',
+                    'details': response.to_dict()
+                }
+                
+            except client.rest.ApiException as e:
+                if e.status == 404:
+                    raise Exception(f"{component_type} '{component_name}' not found in namespace '{namespace}'")
+                else:
+                    raise Exception(f"Failed to update {component_type}: {str(e)}")
+            except Exception as e:
+                raise Exception(f"Failed to update {component_type}: {str(e)}")
+            finally:
+                # Clean up temporary file
+                try:
+                    os.unlink(kubeconfig_path)
+                except:
+                    pass
+                    
         except Exception as e:
+            logger.error(f"Failed to update component YAML: {str(e)}")
             raise Exception(f"Failed to update component YAML: {str(e)}")
 
     async def update_pod_yaml(self, cluster_name: str, pod_name: str, 
