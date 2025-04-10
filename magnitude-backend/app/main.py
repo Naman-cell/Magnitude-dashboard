@@ -1,6 +1,13 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api.v1.api import api_router
+from fastapi import APIRouter
+from app.api.v1.endpoints.container_registry import router as ecr_router
+from app.api.v1.endpoints.k8s import router as eks_router
+
+api_router = APIRouter()
+
+api_router.include_router(ecr_router, prefix="/api/v1")
+api_router.include_router(eks_router, prefix="/api/v1") 
 
 app = FastAPI(
     title="Magnitude Dashboard API",
@@ -20,6 +27,3 @@ app.add_middleware(
 @app.get("/")
 async def root():
     return {"message": "Welcome to Magnitude Dashboard API"}
-
-# Include API router
-app.include_router(api_router) 
