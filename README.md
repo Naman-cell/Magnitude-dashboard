@@ -1,3 +1,4 @@
+![Banner](./magnitude-ui/public/A_VISUAL_INTERFACE_FOR_CONTAINERIZED_OBSERVABILITY_BUILT_WITH_FASTAPI_REA_20250409_232221_0000.png)
 # 🚀 Magnitude Dashboard
 
 Magnitude Dashboard is a full-stack observability and orchestration platform built using FastAPI (backend) and React + React Flow (frontend), designed to visualize, manage, and control containerized applications running in cloud-hosted Kubernetes clusters.
