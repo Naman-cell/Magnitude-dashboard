@@ -1,9 +1,10 @@
 import boto3
 import os
-from typing import List, Dict, Any
+from typing import List, Dict, Any,Optional
 from datetime import datetime
 from dotenv import load_dotenv
-
+import asyncio
+from fastapi import HTTPException
 class ECRService:
     def __init__(self):
         # Load environment variables from .env file
@@ -16,6 +17,39 @@ class ECRService:
             aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
             region_name=os.getenv('AWS_DEFAULT_REGION')
         )
+
+
+    async def list_repositories(
+        self, max_results: int = 50, next_token: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """List all repositories in Amazon ECR."""
+        try:
+            params = {"maxResults": max_results}
+            if next_token:
+                params["nextToken"] = next_token
+
+            response = await asyncio.to_thread(self.ecr_client.describe_repositories, **params)
+            return response
+
+        except self.ecr_client.exceptions.RepositoryNotFoundException:
+            raise HTTPException(status_code=404, detail="ECR repository not found.")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to list ECR repositories: {str(e)}")
+
+    async def describe_repository(self, repository_name: str) -> Dict[str, Any]:
+        """Describe a specific Amazon ECR repository."""
+        try:
+            response = await asyncio.to_thread(
+                self.ecr_client.describe_repositories,
+                repositoryNames=[repository_name],
+            )
+            return response.get("repositories", [])[0] if response.get("repositories") else {}
+
+        except self.ecr_client.exceptions.RepositoryNotFoundException:
+            raise HTTPException(status_code=404, detail=f"ECR repository '{repository_name}' not found.")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to describe ECR repository: {str(e)}")
+
 
     async def list_images(self) -> List[Dict[str, Any]]:
         """
